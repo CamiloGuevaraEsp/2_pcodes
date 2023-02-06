@@ -4,7 +4,7 @@ close all; clear all;
 %Created by: Cynthia T. Hsu
 %Modified by: Camilo Guevara 2023/02/06 (modification includes conserving
 %the number and position of the selected ROIs, saving it into the maskmat
-%structure and showing the mask and the average image with the numbvers). 
+%structure and showing the mask and the average image with the numbers). 
 
 [file,path] = uigetfile('*.mat');
 
