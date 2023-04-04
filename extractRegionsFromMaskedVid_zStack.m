@@ -1,170 +1,137 @@
-%Inputs:
-%1) rootdir (where we store the output data).
-%2) TSeries folder (where we keep the raw data)
-%3) TImgRoot - this refers to the frames we want to extract pixel intensity values from. Generally do
-%not have to change this (except to specify Ch2 versus Ch1); should match
-%TSeriesFolder.
-%4) TMaskRoot - this refers to the name of the images we want to use for
-%the mask. In cases where there is mCherry (Ch1) present, then use this to
-%mask. Otherwise, use Ch2 for the mask.
-%5) TProjMask: Helps restrict the field of view to the region where the
-%cells are.
-%By: Cynthia T. Hsu
+%C.G. Interpretation of this code:
+% It loads the .tif images and create a z projection of it, then it define
+% a threshold based on the minimum, maximun and median pixel value, create
+% a binary mask of the z-projection based on that threshold. 
+%Saves the z-projection, the thesholded images and properties such as the
+%pixel centroid coordinate and area. 
+%Two questions:
+%1: Why is maxframes2read = 300
+%2: Why is the threshold defined in that way (line 105)? 
+% INPUTS: Cycle and channel of data to take a Z projection of.
+%OUTPUTS:
+%Saves a struct which contains "avgIntensity"
+%%numFrames: total # of frames.
+%%sumFrame: sum of intensities at each position.
+%
+% Not yet complete as of 05/02/21
+%By: Cynthia T. Hsu 
 
-%OUTPUT:
-% A.regionPropsArray = regionPropsArray;
-% A.TProjMask = TProjMask;
-% save(outname,'-struct','A.mat
+function [sumFrame,numFrames] = write2PhotonTProjMask(varargin)
 
-function extractRegionsFromMaskedVid_zStack()
-rootdir = '/Volumes/Camilo_2/pdfgal4_r23e10gal4_UASASAP2s'
-% rootdir = 'D:\Hugin\emptyChrimson_HugS3_Arclight';
-TSeriesFolder = 'TSeries-11152022-1407-1031'; %_Cycle00001_Ch2__userDrawnMask';
-% D:\Hugin\HugLexA_csChrimson_hugArclight\201007\TSeries-Mask10072020-1456-494
-cycleStart = 1;
-cycleStartString = ['Cycle' num2str(cycleStart,'%05.0f')];
+% close all; clear all;
+if(nargin==0),
+    rootdir = '/Users/camilog/Downloads/test_images';
+    TSeriesFolder = 'TSeries-11082022-1509-1030';
+    %Only change variables above this line
+    %--------------------------------------------------
+%     rootdir = 'D:\Rebecca\GH146'; %D:\Hugin\HugLexA_csChrimson_hugArclight\
+%     TSeriesFolder = 'TSeries-08192022-1429-887';
+    %Every image in the TSeries folder is in this format:
+    %TSeries-10222019-1549-340_Cycle00001_Ch1_000013.ome;
+    
+    TImgRoot = [TSeriesFolder '_Cycle00001_Ch2_'];
+    %Cycle number indicates the time stamp.
+    %
+    
+    %The last time I used this script when I remembered what I was doing:
+    %     rootdir = 'D:\84C10Gal4_UASGCaMP_RFP_180607\'
+    %     TSeriesFolder = 'TSeries-06072018-1333-279';
+    %     TImgRoot = [TSeriesFolder '_Cycle00001_Ch2_'];
+else, %The variables we entered in above are being called by an external script.
+    rootdir = varargin{1};
+    TSeriesFolder = varargin{2};
+    TImgRoot = [TSeriesFolder '_Cycle00006_Ch' varargin{3} '_'];
+end;
 
-TImgRoot = [TSeriesFolder '_' cycleStartString '_Ch2_'];%000001.ome
-% TMaskRoot = strrep(TImgRoot,'Ch2','Ch1');
-% TProjMask = [TSeriesFolder '_Cycle00001_Ch2__maskReg3.mat']
-TProjMask = 'TSeries-11152022-1407-1031_Cycle00001_Ch2__maskReg2 5 6 9.mat';
+if(strfind(TImgRoot,'_Ch2_')),
+    %     img2mask = strrep(TImgRoot,'_Ch2_', '_Ch1_TprojMask.mat');
+    %     outname = [TImgRoot '_maskedByCh1.mat'];
+    outname = [TImgRoot '_mask.mat'];
+else,
+    img2mask = strrep(TImgRoot,'_Ch1_', '_Ch1_mask.mat');
+    outname = img2mask;
+end;
 
-slicesPerStack = 4;
-cycleList = [1]; %:73; %cycleStart:73; %:73; %[2 1046]; %In high speed T-series, just one cycle for the entire series.
-%----------------------------------------------------------------------------
-% cycleList = [cycleStart:70:212];
-% cycleList = [1 1346 2691];
-%If Piezo is not used, each stack is a separate cycle.
-% cycleList = [1:1:475]; %1793]; %cycleStart 685 1368 2051]; % 938 1406 66 130 194 402 610 818 1174];
-readChannel1 = 0; 
-writeVid = 0;
-upperStretchLim = 0.1;
+maxNumFrames = 120*4*20; %120 seconds, 4 Hz, 20 slices - this is super important for the 90 minute recordings because otherwise this script will take forever to run when it really shouldn't.
+
+
 medfiltSize = 1;
 
 cd(rootdir);
+cd(TSeriesFolder);
+% Last frame: 'fc2_save_2017-12-01-173304-10412';
+tiffList = dir([TImgRoot '*.tif']);
+display(TImgRoot);
+display(numel(tiffList));
 
-if(writeVid),
-    %     vidObj = VideoWriter([TImgRoot '_BWthresh' num2str(bwThresh) '_upperStretchLim ' num2str(upperStretchLim) '_medfilt'  num2str(medfiltSize) '.avi']);
-    vidObj = VideoWriter([TImgRoot '_upperStretchLim ' num2str(upperStretchLim) '.avi']);
-end;
-A = load(TProjMask);
-tProjMaskMat = A.bwFrame;
-tProjRegions = regionprops(tProjMaskMat>0,'Area','BoundingBox','Centroid','PixelIdxList'); %,'PixelValues');
+% maxFrame2read = 8548; %numel(tiffList);
+maxFrame2read = 300; %numel(tiffList);
+maxFrame2read = min(maxFrame2read,numel(tiffList));
 
-if(writeVid),
-    open(vidObj);
-end;
-
-maskImg = tProjMaskMat;
-for(ci = 1:numel(cycleList)),
-    cd(TSeriesFolder);
-    cycleText = ['Cycle' num2str(cycleList(ci),'%05.0f')]
-    imgRootForCycle = strrep(TImgRoot,cycleStartString,cycleText);
-    tiffList = dir([imgRootForCycle '*.ome.tif']);
-    outname = strrep(TProjMask, '.mat',['_' cycleText '_' 'Intensities.mat']);
-    %     outname = strrep(outname,cycleStartString,cycleText);
-    %     display(numel(tiffList));
-    
-    % maxFrame2read = 8548; %numel(tiffList);
-    maxFrame2read = numel(tiffList);
-    regionPropsArray = cell(maxFrame2read,2);
-    for(ti = 1:maxFrame2read),
-        %         if(~readChannel1),
-        if(ti<=200 || mod(ti,100)==0),
-            display(ti);
-            if(ti==200),
-                display(['Have demonstrated first 200 frames are read. Now outputting once every 100 frames.']);
+% regionPropsArray = cell(maxFrame2read,1);
+for(ti = 1:maxFrame2read),
+    if(mod(ti,15)>7),
+%         display(ti);
+        imgName = [TImgRoot num2str(ti,'%06.0f') '.ome.tif']
+%         try,
+%C.G. Apply a median filter to each image and then it sums it. Creating a
+%projection of the z-stack
+            rawImg = double(medfilt2(imread(imgName),[medfiltSize medfiltSize]));
+            %     rawImg_doubleVec =double(rawImg(:));
+            %     display(size(rawImg));
+            % dbquit
+            %         if(ti == 1),
+            if(~exist('allImgSum','var')),
+                
+                allImgSum =zeros(size(rawImg,1),size(rawImg,2));
             end;
-        end;
-        %         end;
-        imgName = [imgRootForCycle num2str(ti,'%06.0f') '.ome.tif'];
-        if(exist(imgName,'file'))
-            try,
-                rawImg = imread(imgName); %This rawImg contains the data that we probably want to extract data from (GCamp6m)
-            catch,
-                rawImg(:) = NaN; %(size(rawImg,1),size(rawImg,2));
-            end;
-            if(readChannel1),
-                maskName = strrep(imgName,'Ch2','Ch1');
-                if(exist(maskName,'file')),
-                    try,
-                        maskImg = imread(maskName);
-                        %                 display(['Successfully read in ' maskName]);
-                    catch,
-                        maskImg(:) = NaN;
-                        display(['Could not read ' maskName]);
-                    end;
-                else,
-                    maskImg(:) = NaN;
-                    display(['Could not find a file matching maskName']);
-                end;
-                %                         else,
-            end;
-            if(mod(ti,slicesPerStack)==1),
-                imageDataInStack = NaN(size(rawImg,1)*size(rawImg,2),slicesPerStack);
-                maskDataInStack = NaN(size(rawImg,1)*size(rawImg,2),slicesPerStack);
-                if(ti~=1 && writeVid),
-                    
-                    I = getframe(h);
-                    writeVideo(vidObj,I); %uint16(I)); %, vidObj);
-                    % if(exist('h','var')),
-                    %                     writeVideo(uint8(round(sumProjection)), vidObj);
-                    close(figure(1));
-                    % end;
-                end;
-            elseif(mod(ti,slicesPerStack)==0 && writeVid),
-                sumProjectionVector = nansum(imageDataInStack,2);
-                %                 above255 = find(sumProjectionVector>255);
-                %                 sumProjectionVector(above255) = 255;
-                sumProjection = reshape(sumProjectionVector,size(rawImg,1),size(rawImg,2));
-                h = figure(1);
-                imagesc(sumProjection,[0 4000]); %*13]); %1000]); %*13]);
-            end;
-            stackIndex = mod(ti,slicesPerStack);
-            %             display(sum(rawImg(:)==0));
+            allImgSum = allImgSum+rawImg;
             
-            if(stackIndex~=0), %Just save the data into hte stack.
-                imageDataInStack(:,stackIndex) = double(rawImg(:));
-                maskDataInStack(:,stackIndex) = double(maskImg(:));
-            else,
-                imageDataInStack(:,slicesPerStack) = double(rawImg(:));
-                maskDataInStack(:,slicesPerStack) = double(maskImg(:));
-                
-                %Find the mean.
-                meanImg = mean(imageDataInStack,2);
-                meanMask = mean(maskDataInStack,2);
-                
-                medFiltFrame = double(medfilt2(uint16(reshape(meanImg,size(rawImg,1),size(rawImg,2))),[medfiltSize medfiltSize]));
-                ctrlMedFiltFrame = double(medfilt2(uint16(reshape(meanMask,size(rawImg,1),size(rawImg,2))),[medfiltSize medfiltSize]));
-                
-                bwSignal = im2bw(medFiltFrame.*tProjMaskMat,0);
-                bwCtrl = im2bw(ctrlMedFiltFrame.*tProjMaskMat,0);
-                
-                for(si = 1:numel(tProjRegions)),
-                    thisRegion = tProjRegions(si);
-                    if(0), %writeVid),
-                        plot(thisRegion.BoundingBox(1),thisRegion.BoundingBox(2),'ro');
-                    end;
-                    realAreas{si} = thisRegion;
-                    pxIntensitiesForRegions{si,2} = medFiltFrame(thisRegion.PixelIdxList);
-                    pxIntensitiesForRegions{si,1} = ctrlMedFiltFrame(thisRegion.PixelIdxList);
-                    %             display(thisRegion.BoundingBox);
-                end;
-                
-                regionPropsArray{ti,1} = realAreas;
-                regionPropsArray{ti,2} = pxIntensitiesForRegions;
-                
-            end;
-        else,
-            display(['Could not find file ' imgName]);
-        end;
+%         catch,
+%         end;
     end;
-    cd(rootdir);
-    A.regionPropsArray = regionPropsArray;
-    A.TProjMask = TProjMask;
-    A.TSeriesFolder = TSeriesFolder;
-    save(outname,'-struct','A','-v7.3');
 end;
-if(writeVid),
-    close(vidObj);
+
+cd(rootdir);
+if(nargin==0),
+    avgImg = allImgSum/maxFrame2read;
+    [n,xout] = hist(avgImg(:),1:128);
+    figure; plot(xout,n);
+    medianPxVal = median(avgImg(:));
+    maxPxVal = max(avgImg(:));
+    minPxVal = min(avgImg(:));
+    % bwThresh = 2*medianPxVal/maxPxVal;
+    % try,
+    bwThresh = (medianPxVal+(medianPxVal-minPxVal))/maxPxVal;
+    if(bwThresh>1),
+        cumsum_n = cumsum(n/sum(n));
+        highIndex = find(cumsum_n>0.98,1);
+        bwThresh = xout(highIndex)/maxPxVal;
+    end;
+    
+    figure; imagesc(avgImg/maxPxVal);
+    
+    bwFrame = im2bw(avgImg/maxPxVal,bwThresh);
+    
+    s = regionprops(bwFrame>0,'Area','Centroid');
+    
+    imshow(uint8(avgImg));
+
+    %Shows the thresholded pixels 
+    figure; imshow(uint8(bwFrame*256));
+    % for(si = 1:numel(s)),
+    %     text(s(si).Centroid(1),s(si).Centroid(2),num2str(si),'r');
+    % end;
+    
+    % img2mask = strrep(TImgRoot,'_Ch2_', '_Ch1_mask.mat']);
+    save(outname,'avgImg','bwThresh','bwFrame','s');
+    imwrite(uint8(bwFrame*256),strrep(outname,'.mat','.tif'));
+else,
+    sumFrame = allImgSum;
+    numFrames = maxFrame2read;
 end;
+% catch,
+%     save(outname,'avgImg');
+% imwrite(strrep(outname,'.mat'),'.tif',uint8(bwFrame*256));
+%
+% end;
