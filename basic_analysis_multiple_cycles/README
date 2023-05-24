@@ -1,0 +1,8 @@
+This set of codes are used to analyze two photon data when it is stored as multiple cycles
+Be sure that your Matlab version has the imaging processing and signal processing toolboxes installed
+The order of operations is: 
+1- write2PhotonTProjMask_V2_CG_multCycles
+2- uiDrawMultipleMasks
+3-extractRegionsFromMaskedVid_zStack_multiplecycles
+4-output2P_intensityVsTime_cellBodies (for this open and modify readTimeFromXML and keep the code shutterStartAndStopFromText in your folder)
+5-read_data
