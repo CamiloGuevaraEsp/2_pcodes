@@ -8,12 +8,13 @@
 close all
 rootdir = '/Users/camilog/Downloads/Vishnu_meeting';
 cd(rootdir);
-filename = '20230607_recombinantdfsb_1_zt0_Tseries-004_Cycle00001_Ch2__userDrawnMask__Intensities' ;
+filename = '20230607_recombinantdfsb_1_zt0_Tseries-004_Cycle00001_Ch2__userDrawnMask__Intensities' 
+backgroundColumn = 2;
+signalColumn = 1; ;
 data = readmatrix(filename,'Delimiter',{','});
 time = data(:,1);
 signal = data(:,[3:2:end]);
-backgroundColumn = 2;
-signalColumn = 1; 
+
 %% Filter data and plot the original and the filtered version
 % For this I used a mean windown, feel free to play around with it
 %filtered_data = smoothdata(data(:,[3:2:end]),'movmean',10); 
