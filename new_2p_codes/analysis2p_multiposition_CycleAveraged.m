@@ -1,4 +1,18 @@
 % --- Single-Channel (Ch3/GCaMP) Multi-ROI, Multi-Position, Multi-Cycle Analysis ---
+% CYCLE-AVERAGED VARIANT: identical pipeline to analysis2p_multiposition.m
+% (same ROI drawing, same per-cycle drift registration and ROI-shift
+% correction) but the OUTPUT collapses every cycle's many frames down to
+% ONE value per cycle (the mean across that cycle's frames), instead of
+% keeping every frame as its own row.
+%
+% "Time" for each collapsed cycle is the GlobalFrame of that cycle's
+% MIDDLE frame (ceil(nFramesInCycle/2)) -- i.e. where that cycle sits in
+% the overall frame-ordered sequence, not a real elapsed-time value (no
+% per-frame acquisition timestamps are read here). This keeps the same
+% GlobalFrame numbering used throughout the per-frame version, so a
+% cycle-averaged point and a per-frame point can still be compared on
+% the same axis if needed.
+%
 % Handles experiments where multiple stage positions are revisited
 % repeatedly across a long recording (e.g. positions 1-7 cycling in
 % sequentially-numbered TSeries folders: ..._-898, ..._-899, ..., ..._-904,
@@ -12,26 +26,21 @@
 %   2. No real-time axis: everything is indexed by GlobalFrame (1, 2, 3...
 %      across the whole concatenated position). Stimulation is marked by
 %      the folder-suffix-number threshold you provide (e.g. "-940 onward
-%      is stim") -- every frame from a folder past that number is flagged
-%      StimPeriod = true in the CSV, and the first such GlobalFrame is
-%      marked with a vertical line on the plots.
-%   3. Drift correction is CONTINUOUS and PER-CYCLE, not a manual
-%      first/last spot-check with a single step-change cutover. You draw
-%      the ROI(s) + background ROI ONCE, on the first-visit projection.
-%      The script then registers every OTHER cycle's projection against
-%      that same first-visit reference (whole-frame template match --
-%      the same method validated in drift_check_all_positions.m) and
-%      translates the ROI/background masks by that cycle's own measured
-%      pixel shift before extracting. This replaces the old "redraw on
-%      last visit, use early mask for the first half / late mask for the
-%      second half" approach, which only corrected for a single step
-%      change and assumed drift (if any) was a clean binary switch --
-%      most positions actually drift gradually or start drifting mid-way
-%      through, which a two-mask step correction can't track.
+%      is stim") -- every cycle whose folder number is past that
+%      threshold is flagged StimPeriod = true in the CSV, and the first
+%      such cycle's mid-frame GlobalFrame is marked with a vertical line
+%      on the plots.
+%   3. Drift correction is CONTINUOUS and PER-CYCLE. You draw the ROI(s)
+%      + background ROI ONCE, on the first-visit projection. The script
+%      then registers every OTHER cycle's projection against that same
+%      first-visit reference (whole-frame template match -- the same
+%      method validated in drift_check_all_positions.m) and translates
+%      the ROI/background masks by that cycle's own measured pixel shift
+%      before extracting.
 %   4. Corrupted/unreadable TIFF files do NOT stop the run. If a frame
-%      can't be read, it's logged with a warning, its values are set to
-%      NaN for that GlobalFrame, and extraction continues with the next
-%      frame.
+%      can't be read, it's excluded (NaN) from that cycle's average
+%      rather than stopping extraction; NValidFrames per cycle records
+%      how many frames actually went into each average.
 %
 % ASSUMPTIONS YOU SHOULD VERIFY:
 %   - Folder naming is "<anything>-<NUM>" where NUM is a sequential
@@ -44,6 +53,13 @@
 %     shift stays flat/plateaus is the tell), a whole-frame translation
 %     correction will not fully fix it and the extracted trace should be
 %     treated with caution.
+%   - Averaging within a cycle assumes the signal is roughly stationary
+%     across that cycle's frames (e.g. a slow calcium signal relative to
+%     the frame rate). If the signal changes meaningfully WITHIN a single
+%     cycle's acquisition window, collapsing to one value per cycle
+%     discards that within-cycle dynamic -- use the per-frame version
+%     (analysis2p_multiposition.m) instead if that matters for your
+%     analysis.
 
 
 clear; clc; close all;
@@ -73,7 +89,7 @@ prompt = {
     'Folder suffix number of the LAST folder in the whole experiment:', ...
     'Folder suffix number where stimulation STARTED (inclusive -- e.g. 940 if -940 itself is the first stim folder):'
     };
-dlgtitle = 'Multi-position experiment setup';
+dlgtitle = 'Multi-position experiment setup (cycle-averaged)';
 dims = [1 60];
 definput = {'1736','10','1','1855','1796'};
 answer = inputdlg(prompt, dlgtitle, dims, definput);
@@ -166,8 +182,10 @@ frameInFolderIdx = zeros(nFramesTotal,1);
 folderNumIdx = zeros(nFramesTotal,1);
 
 ptr = 0;
+cycleStartPtr = zeros(nCycles,1); % GlobalFrame offset (0-based) where each cycle begins
 for k = 1:nCycles
     n = nFramesPerFolder(k);
+    cycleStartPtr(k) = ptr;
     idx = ptr + (1:n);
     cycleIdx(idx) = k;
     frameInFolderIdx(idx) = (1:n)';
@@ -175,21 +193,84 @@ for k = 1:nCycles
     ptr = ptr + n;
 end
 
-%% === Stimulation period, from the folder-number threshold ===
-% Every frame belonging to a folder whose number is >= stimStartFolderNum
-% (the entered folder number itself IS the first stim folder).
-stimPeriod = folderNumIdx >= stimStartFolderNum;
+%% === Per-cycle frame-count "time" (kept for reference/cross-checking only) ===
+% GlobalFrame just counts frames -- it silently assumes frames are
+% packed back-to-back with no gap between cycles, which is false here:
+% between one visit to this position and the next, the microscope has to
+% cycle through every OTHER position first, a real gap of many seconds
+% that a frame counter can't see. See the REAL time block below, which
+% reads actual acquisition timestamps from each folder's XML instead.
+midFrameInFolder = ceil(nFramesPerFolder / 2);
+midGlobalFrame = cycleStartPtr + midFrameInFolder;
 
-stimCycle = find(foundNums >= stimStartFolderNum, 1, 'first');
+%% === Per-cycle REAL time: XML timestamp of the middle frame ===
+% Each TSeries folder's .xml records a real wall-clock acquisition start
+% (PVScan date + Sequence time) plus, per frame, a relativeTime (seconds
+% since that start) and the exact Ch3 filename it belongs to. Combining
+% those gives the true acquisition time of any frame -- unlike
+% GlobalFrame, this correctly reflects the real gap caused by cycling
+% through the other positions between revisits.
+midFrameDatetime = NaT(nCycles, 1);
+for k = 1:nCycles
+    xmlFiles = dir(fullfile(folderList{k}, '*.xml'));
+    if numel(xmlFiles) ~= 1
+        error('Expected exactly one .xml file in %s, found %d.', folderList{k}, numel(xmlFiles));
+    end
+    xmlPath = fullfile(xmlFiles(1).folder, xmlFiles(1).name);
+    midFilename = folderCh3Files{k}{midFrameInFolder(k)};
+    [seqStart, relTime] = readFrameTimeFromXML(xmlPath, midFilename);
+    midFrameDatetime(k) = seqStart + seconds(relTime);
+end
+
+% Anchor t=0 at the very first folder of the WHOLE experiment (position 1,
+% cycle 1, folder -startNum) rather than this position's own cycle 1, so
+% that different positions' cycle-averaged CSVs share a common absolute
+% timeline -- positions are interleaved in real time, not run back to
+% back, so this is what makes their timestamps comparable to each other.
+% Falls back to this position's own cycle 1 if that folder can't be
+% found/read (ElapsedTime_sec is then only meaningful within this CSV).
+try
+    expStartKey = num2str(startNum);
+    if ~isKey(folderNumberMap, expStartKey)
+        error('Folder -%d (experiment start, position 1 cycle 1) not found.', startNum);
+    end
+    expStartFolder = folderNumberMap(expStartKey);
+    expStartXmlFiles = dir(fullfile(expStartFolder, '*.xml'));
+    if numel(expStartXmlFiles) ~= 1
+        error('Expected exactly one .xml file in %s, found %d.', expStartFolder, numel(expStartXmlFiles));
+    end
+    experimentStart = readSequenceStartTime(fullfile(expStartXmlFiles(1).folder, expStartXmlFiles(1).name));
+catch ME
+    warning(['Could not read the experiment''s absolute start time (%s) -- using this ' ...
+        'position''s own cycle 1 as t=0 instead. ElapsedTime_sec will NOT be comparable ' ...
+        'across different positions in that case.'], ME.message);
+    experimentStart = midFrameDatetime(1);
+end
+
+ElapsedTime_sec = seconds(midFrameDatetime - experimentStart);
+fprintf('Cycle mid-frame real times (elapsed seconds since experiment start):\n');
+for k = 1:nCycles
+    fprintf('  Cycle %d (folder -%d): %s (%.1f s)\n', ...
+        k, foundNums(k), string(midFrameDatetime(k), 'HH:mm:ss.SSS'), ElapsedTime_sec(k));
+end
+
+%% === Stimulation period, from the folder-number threshold ===
+% A cycle counts as stim if its folder number is >= stimStartFolderNum
+% (the entered folder number itself IS the first stim folder).
+stimPeriodByCycle = foundNums(:) >= stimStartFolderNum;
+
+stimCycle = find(stimPeriodByCycle, 1, 'first');
 if isempty(stimCycle)
     warning(['No folder in this position''s sequence has a number > %d -- ' ...
         'stimulation never starts within this position''s data. ' ...
         'Stim marker will not be plotted.'], stimStartFolderNum);
-    stimStartGlobalFrame = NaN;
+    stimStartMidGlobalFrame = NaN;
+    stimStartElapsedSec = NaN;
 else
-    stimStartGlobalFrame = find(cycleIdx == stimCycle, 1, 'first');
-    fprintf('Stimulation starts at folder -%d (cycle %d of %d), GlobalFrame = %d\n', ...
-        foundNums(stimCycle), stimCycle, nCycles, stimStartGlobalFrame);
+    stimStartMidGlobalFrame = midGlobalFrame(stimCycle);
+    stimStartElapsedSec = ElapsedTime_sec(stimCycle);
+    fprintf('Stimulation starts at folder -%d (cycle %d of %d), %.1f s elapsed.\n', ...
+        foundNums(stimCycle), stimCycle, nCycles, stimStartElapsedSec);
 end
 
 %% === Build a projection for EVERY cycle ===
@@ -370,7 +451,7 @@ end
 roiSizesByCycle = cellfun(@nnz, roiMasksByCycle);
 bkgSizeByCycle = cellfun(@nnz, bkgMaskByCycle);
 
-%% === Initialize extraction arrays ===
+%% === Initialize extraction arrays (still per-frame -- averaged after) ===
 roiCh3 = zeros(nFramesTotal, roiCount);
 bkgCh3 = zeros(nFramesTotal, 1);
 
@@ -379,7 +460,9 @@ fprintf('Processing %d frames across %d folders...\n', nFramesTotal, nCycles);
 %% === Loop over folders and frames ===
 % Bounding box (and therefore the on-disk PixelRegion crop) is recomputed
 % PER CYCLE now, since the shifted mask position moves cycle to cycle --
-% see maskSetBoundingBox below.
+% see maskSetBoundingBox below. Extraction still happens frame-by-frame
+% (there's no way to average without first reading every frame); the
+% collapse to one value per cycle happens afterward.
 ptr = 0;
 tExtractionStart = tic;
 framesDoneSoFar = 0;
@@ -455,47 +538,70 @@ for k = 1:nCycles
     end
 end
 
-%% === Corrected ===
+%% === Corrected (still per-frame) ===
 corrCh3 = roiCh3 - bkgCh3_scaled;
 
-%% === Save CSV ===
-GlobalFrame = (1:nFramesTotal)';
-Cycle = cycleIdx;
-FolderNum = folderNumIdx;
-FrameInFolder = frameInFolderIdx;
-StimPeriod = stimPeriod;
-ShiftX = shiftX(cycleIdx);
-ShiftY = shiftY(cycleIdx);
-RegConfidence = regConfidence(cycleIdx);
+%% === Collapse each cycle's frames down to ONE averaged value ===
+% mean(..., 'omitnan') so corrupted/unreadable frames (NaN) don't pull
+% down the average; NValidFrames records how many frames actually
+% contributed, in case a cycle lost a large fraction of its frames.
+roiCh3_cycleMean = nan(nCycles, roiCount);
+bkgCh3_scaled_cycleMean = nan(nCycles, roiCount);
+corrCh3_cycleMean = nan(nCycles, roiCount);
+nValidFrames = zeros(nCycles, roiCount);
 
-T = table(GlobalFrame, Cycle, FolderNum, FrameInFolder, StimPeriod, ShiftX, ShiftY, RegConfidence);
-
-for r = 1:roiCount
-    T.(['Ch3_Raw_ROI' num2str(r)]) = roiCh3(:,r);
-    T.(['Ch3_BkgScaled_ROI' num2str(r)]) = bkgCh3_scaled(:,r);
-    T.(['Ch3_Corrected_ROI' num2str(r)]) = corrCh3(:,r);
+for k = 1:nCycles
+    inCycle = (cycleIdx == k);
+    for r = 1:roiCount
+        roiCh3_cycleMean(k,r) = mean(roiCh3(inCycle,r), 'omitnan');
+        bkgCh3_scaled_cycleMean(k,r) = mean(bkgCh3_scaled(inCycle,r), 'omitnan');
+        corrCh3_cycleMean(k,r) = mean(corrCh3(inCycle,r), 'omitnan');
+        nValidFrames(k,r) = nnz(~isnan(corrCh3(inCycle,r)));
+    end
 end
 
-outFile = fullfile(parentFolder, sprintf('Position%d_MultiCycle_FullTraces.csv', posToProc));
+%% === Save CSV (one row per CYCLE) ===
+Cycle = (1:nCycles)';
+FolderNum = foundNums(:);
+NFramesInCycle = nFramesPerFolder;
+MidFrameInFolder = midFrameInFolder;
+MidGlobalFrame = midGlobalFrame; % frame-count reference only -- see ElapsedTime_sec for real time
+MidFrameDatetime = midFrameDatetime; % real acquisition time (from XML) of each cycle's mid frame
+StimPeriod = stimPeriodByCycle;
+ShiftX = shiftX;
+ShiftY = shiftY;
+RegConfidence = regConfidence;
+
+T = table(Cycle, FolderNum, NFramesInCycle, MidFrameInFolder, MidGlobalFrame, ...
+    MidFrameDatetime, ElapsedTime_sec, StimPeriod, ShiftX, ShiftY, RegConfidence);
+
+for r = 1:roiCount
+    T.(['Ch3_Raw_ROI' num2str(r) '_Mean']) = roiCh3_cycleMean(:,r);
+    T.(['Ch3_BkgScaled_ROI' num2str(r) '_Mean']) = bkgCh3_scaled_cycleMean(:,r);
+    T.(['Ch3_Corrected_ROI' num2str(r) '_Mean']) = corrCh3_cycleMean(:,r);
+    T.(['NValidFrames_ROI' num2str(r)]) = nValidFrames(:,r);
+end
+
+outFile = fullfile(parentFolder, sprintf('Position%d_MultiCycle_CycleAveraged.csv', posToProc));
 writetable(T, outFile);
 
-%% === Plot PER ROI (GlobalFrame x-axis, stim onset marked) ===
+%% === Plot PER ROI (real elapsed time x-axis, one point per cycle) ===
 for r = 1:roiCount
 
     figure;
-    plot(GlobalFrame, roiCh3(:,r), '-g', 'LineWidth', 1.2); hold on;
-    plot(GlobalFrame, bkgCh3_scaled(:,r), '--k', 'LineWidth', 1.2);
-    plot(GlobalFrame, corrCh3(:,r), '-b', 'LineWidth', 1.5);
-    if ~isnan(stimStartGlobalFrame)
-        xline(stimStartGlobalFrame, '--m', 'Stim', 'LineWidth', 1.5);
+    plot(ElapsedTime_sec, roiCh3_cycleMean(:,r), '-og', 'LineWidth', 1.2); hold on;
+    plot(ElapsedTime_sec, bkgCh3_scaled_cycleMean(:,r), '--k', 'LineWidth', 1.2);
+    plot(ElapsedTime_sec, corrCh3_cycleMean(:,r), '-ob', 'LineWidth', 1.5);
+    if ~isnan(stimStartElapsedSec)
+        xline(stimStartElapsedSec, '--m', 'Stim', 'LineWidth', 1.5);
     end
-    xlabel('Global Frame'); ylabel('Intensity');
-    title(sprintf('Position %d - Ch3 (GCaMP) - ROI %d', posToProc, r));
+    xlabel('Elapsed time (s, since experiment start -- from XML timestamps)'); ylabel('Mean intensity');
+    title(sprintf('Position %d - Ch3 (GCaMP) - ROI %d (cycle-averaged)', posToProc, r));
     legend('Raw ROI', 'Background (scaled)', 'Corrected');
     grid on;
 end
 
-fprintf('\n Done. Results saved to:\n%s\n', outFile);
+fprintf('\n Done. Cycle-averaged results saved to:\n%s\n', outFile);
 
 %% =====================================================================
 %% Local functions
@@ -552,6 +658,46 @@ function bbox = maskSetBoundingBox(roiMasks, bkgMask)
     end
     bbox.rowRange = [min(rows), max(rows)];
     bbox.colRange = [min(cols), max(cols)];
+end
+
+function seqStart = readSequenceStartTime(xmlPath)
+    % Real wall-clock start time of a TSeries folder's acquisition,
+    % combining the PVScan tag's calendar date with the Sequence tag's
+    % more precise (sub-second) time-of-day -- both describe the same
+    % moment, but PVScan's date attribute rounds to whole seconds.
+    xmlText = fileread(xmlPath);
+
+    dateTok = regexp(xmlText, '<PVScan[^>]*\sdate="([^"]+)"', 'tokens', 'once');
+    if isempty(dateTok)
+        error('Could not find a PVScan date attribute in %s', xmlPath);
+    end
+    pvScanDate = datetime(dateTok{1}, 'InputFormat', 'M/d/yyyy h:mm:ss a');
+
+    timeTok = regexp(xmlText, '<Sequence[^>]*\stime="([^"]+)"', 'tokens', 'once');
+    if isempty(timeTok)
+        error('Could not find a Sequence time attribute in %s', xmlPath);
+    end
+    seqTimeOfDay = duration(timeTok{1}, 'InputFormat', 'hh:mm:ss.SSSSSSS');
+
+    seqStart = dateshift(pvScanDate, 'start', 'day') + seqTimeOfDay;
+end
+
+function [seqStart, relTime] = readFrameTimeFromXML(xmlPath, targetFilename)
+    % seqStart: real wall-clock start time of this folder's acquisition.
+    % relTime: seconds elapsed from seqStart to the specific frame whose
+    % Ch3 filename is targetFilename (matched by filename, not by
+    % assuming XML Frame order matches the sorted file list -- exact and
+    % robust to either list being reordered).
+    seqStart = readSequenceStartTime(xmlPath);
+    xmlText = fileread(xmlPath);
+
+    escapedName = regexptranslate('escape', targetFilename);
+    pattern = ['<Frame relativeTime="([^"]+)"[^>]*>\s*<File[^>]*filename="' escapedName '"'];
+    relTok = regexp(xmlText, pattern, 'tokens', 'once');
+    if isempty(relTok)
+        error('Could not find a frame timestamp for %s in %s', targetFilename, xmlPath);
+    end
+    relTime = str2double(relTok{1});
 end
 
 function folderMap = buildFolderNumberMap(parentFolder)

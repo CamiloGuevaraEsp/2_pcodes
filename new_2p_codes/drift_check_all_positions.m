@@ -40,7 +40,7 @@ prompt = {
     };
 dlgtitle = 'Drift check -- all positions';
 dims = [1 60];
-definput = {'898','7','1073',''};
+definput = {'1736','10','1855','1796'};
 answer = inputdlg(prompt, dlgtitle, dims, definput);
 if isempty(answer)
     error('Setup cancelled.');
